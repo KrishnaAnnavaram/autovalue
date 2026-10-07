@@ -34,6 +34,10 @@
 > vocabulary are in [`docs/ste-style-guide.md`](docs/ste-style-guide.md). Each term in the
 > [Glossary](#18-glossary) has only one meaning.
 
+> [!CAUTION]
+> Do not use a price band as a final price decision. A person must review each `review_low` and `review_high` listing.
+> Data from one market can be biased against rare brands, regions or sellers. Audit the decisions by group.
+
 ---
 
 autovalue gives two estimates for a used-car marketplace: the price of a listing and the delivery time of an order.
@@ -560,8 +564,7 @@ All numbers come from the **synthetic** data. They do not describe a real market
 
 | Validation | Result | Command |
 |---|---|---|
-| Unit tests | **60 passed**, 2 skipped (extras `boost` and `api` absent) | `pytest -q` |
-| Expected CI (fresh venv, `pip install -e ".[dev]"`) | **60 passed**, 2 skipped | `.github/workflows/ci.yml` |
+| Unit tests (CI installs only `.[dev]`) | **60 passed**, 2 skipped (extras `boost` and `api` absent) | `pytest -q` |
 | Price, test MAE (448 rows) | quantile model 83,746 · ridge 101,643 · group median 285,742 · noise floor 58,966 | `autovalue demo` |
 | Price, MAPE / R² | quantile model 0.126 / 0.930 · noise floor 0.102 / 0.975 | `autovalue demo` |
 | Price, model − ridge MAE | −17,897, 95 % CI [−32,748, −4,882]: model better | `autovalue demo` |
