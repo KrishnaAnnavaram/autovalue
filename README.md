@@ -74,6 +74,7 @@ This README is the **one location that explains all of autovalue**. It gives the
 4. 🔄 [The end-to-end workflow](#4-the-end-to-end-workflow)
    - 4.1 [Full flow](#41-full-flow)
    - 4.2 [The life cycle of one listing](#42-the-life-cycle-of-one-listing)
+   - 4.3 [Who does which step](#43-who-does-which-step)
 5. 📋 [The table schemas and validation](#5-the-table-schemas-and-validation)
 6. 🧪 [The synthetic generators](#6-the-synthetic-generators)
 7. 🔵 [Features and the time split](#7-features-and-the-time-split)
@@ -144,7 +145,58 @@ flowchart LR
 | Pipeline | `src/autovalue/pipeline.py` | Train, calibrate, evaluate and format the report |
 | Model files | `src/autovalue/bundle.py` | Save and load `.joblib`, metrics JSON and model card |
 | CLI | `src/autovalue/cli.py` | The `autovalue` command with 8 subcommands |
-| HTTP API | `src/autovalue/api.py` | `/price/estimate`, `/price/approve`, `/eta` (extra `api`) |
+| HTTP API | `src/autovalue/api.py` | `GET /health`, `POST /price/estimate`, `/price/approve`, `/eta` (extra `api`). Gives 503 if the model file is not loaded and 422 if an input column is absent or not valid |
+
+The component map shows which module calls which module. An arrow points from the caller to the module that it uses.
+
+```mermaid
+flowchart TB
+    subgraph ENTRY["Entry points"]
+        CLI["cli.py<br/>autovalue command"]
+        API["api.py<br/>FastAPI app, extra api"]
+    end
+    subgraph DATAIN["Data in"]
+        CFG["config.py<br/>Settings"]
+        SYN["synthetic.py<br/>make_listings, make_deliveries"]
+        LOAD["loaders.py<br/>ADAPTERS"]
+        SCH["schema.py<br/>validate, coerce_input"]
+    end
+    subgraph TRAINEVAL["Train and evaluate"]
+        PIPE["pipeline.py<br/>train_and_evaluate"]
+        SPL["split.py<br/>time_split"]
+        MOD["models/<br/>QuantileModel, baselines"]
+        TSK["tasks.py<br/>PRICE, ETA"]
+        FEAT["features.py<br/>CarFeatures, DeliveryFeatures"]
+        EVA["evaluate.py<br/>metrics, bootstrap"]
+        EXP["explain.py<br/>validation_importance"]
+    end
+    subgraph DECIDE["Decisions"]
+        APR["approval.py<br/>decide, evaluate_rule"]
+        SIM["simulate.py<br/>simulate_negotiation"]
+    end
+    BUN["bundle.py<br/>save, load"]
+
+    CLI --> CFG
+    CLI --> SYN
+    CLI --> LOAD
+    CLI --> SCH
+    CLI --> PIPE
+    CLI --> BUN
+    CLI --> APR
+    CLI --> SIM
+    CLI -- "serve" --> API
+    API --> BUN
+    API --> SCH
+    API --> APR
+    PIPE --> SPL
+    PIPE --> MOD
+    PIPE --> EVA
+    PIPE --> EXP
+    PIPE --> APR
+    BUN --> MOD
+    MOD --> TSK
+    TSK --> FEAT
+```
 
 ### 2.2 System context
 
@@ -196,8 +248,24 @@ The generators, the split fallback, the models, the bootstrap and the negotiatio
 ### 3.4 All fit steps see the training rows only
 The feature builder, the imputers, the encoders and the regressor are steps of one scikit-learn `Pipeline`. `fit` gets only the training part. The target encoder uses cross-fitting inside the training part. Feature ranking uses the validation part, and the test part is used only for the final report.
 
+```mermaid
+flowchart LR
+    ROWS[/"Validated rows"/] --> SPLIT["split.time_split"]
+    SPLIT --> TR["train part"]
+    SPLIT --> VA["validation part"]
+    SPLIT --> TE["test part"]
+    TR --> FIT["fit: feature builder, imputers,<br/>encoders, regressor, baselines"]
+    VA --> CAL["calibrate: band offset"]
+    VA --> IMP["validation_importance"]
+    FIT --> CAL
+    TE --> REP[/"Final report only:<br/>metrics, coverage, approval score"/]
+    CAL --> REP
+    IMP --> REP
+```
+
 ### 3.5 Each model must beat a baseline on a later period
 The split is in time sequence: train, then validation, then test. The report gives the group-median baseline, the ridge baseline, the quantile model and the noise floor on the same test rows. A paired bootstrap tells if the difference to the best baseline is real.
+The `train` command reports this verdict only. It does not stop, and it saves the model also when the baseline is better. Read the verdict before you use the model.
 
 ### 3.6 A band has a stated coverage
 Three quantile models give the low, middle and high values. Conformalized quantile regression on the validation part moves the low and high values, so that the band holds the real value at the nominal rate.
@@ -212,9 +280,9 @@ The approval rule approves only a price inside the calibrated band. A price belo
 ### 4.1 Full flow
 
 ```mermaid
-flowchart TB
+flowchart TD
     SRC{"Data source"} -- "default" --> SYN["synthetic.make_listings / make_deliveries"]
-    SRC -- "--csv" --> CSV["CSV file"]
+    SRC -- "--csv" --> CSV[/"CSV file"/]
     CSV -- "--adapter" --> ADP["loaders: cardekho or amazon-delivery"]
     SYN --> VAL["schema.validate: types, ranges, categories, duplicates"]
     CSV --> VAL
@@ -229,10 +297,49 @@ flowchart TB
     BASE --> EVAL
     EVAL --> APP["approval.evaluate_rule (price task)"]
     EVAL --> SAVE["bundle.save: .joblib, metrics JSON, model card"]
-    SAVE --> USE["estimate, approve, simulate, API"]
+    APP --> SAVE
+    IMP --> SAVE
+    SAVE --> STORE[("models/<br/>task.joblib, task_metrics.json, task_model_card.md")]
+    STORE --> USE["estimate, approve, simulate, API"]
+    CAR[/"Car data and listed price"/] --> USE
+    USE --> DEC{"approval.decide"}
+    DEC -- "inside the band" --> OK[/"auto_approve"/]
+    DEC -- "outside the band" --> HUMAN{{"HUMAN<br/>review_low or review_high"}}
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class HUMAN human
 ```
 
 ### 4.2 The life cycle of one listing
+
+```mermaid
+stateDiagram-v2
+    state "Input record" as Input
+    state "Coerced row" as Coerced
+    state "Feature row" as Featured
+    state "Raw band, model scale" as Raw
+    state "Calibrated band" as Band
+    state "Manual review" as Review
+    state "Negotiation summary" as Simulated
+    [*] --> Input: seller gives car data and listed price
+    Input --> SchemaError: required column absent or not valid
+    Input --> Coerced: coerce_input
+    Coerced --> Featured: CarFeatures.transform
+    Featured --> Raw: 3 pipelines predict, values sorted
+    Raw --> Band: offset applied, exp to price
+    Band --> ValueError: listed price 0 or less
+    Band --> auto_approve: price inside the band
+    Band --> review_low: price below low
+    Band --> review_high: price above high
+    Band --> Simulated: simulate (optional)
+    review_low --> Review: human decides
+    review_high --> Review: human decides
+    auto_approve --> [*]
+    Review --> [*]
+    Simulated --> [*]
+    SchemaError --> [*]
+    ValueError --> [*]
+```
 
 1. The seller gives the car data and a listed price.
 2. `coerce_input` checks the required columns and cleans the categories.
@@ -243,11 +350,69 @@ flowchart TB
 7. A price inside the band gets `auto_approve`. Other prices get `review_low` or `review_high`.
 8. Optionally, `simulate` runs the negotiation for the same band.
 
+### 4.3 Who does which step
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor OP as Operator
+    participant CLI as autovalue CLI
+    participant PIPE as pipeline.py
+    participant QM as QuantileModel
+    participant FS as models/ folder
+    participant API as HTTP API
+    participant LS as Listing service
+
+    OP->>CLI: autovalue train --task price
+    CLI->>CLI: load_dotenv, Settings.from_env
+    CLI->>CLI: _load_frame, then schema.validate
+    CLI->>PIPE: train_and_evaluate(clean, task, settings)
+    PIPE->>PIPE: split.time_split
+    PIPE->>QM: fit(train)
+    PIPE->>QM: predict_band(test), not calibrated
+    PIPE->>QM: calibrate(val)
+    QM-->>PIPE: offset_
+    PIPE->>QM: predict_band(test), calibrated
+    PIPE->>PIPE: baselines, metrics, validation_importance, evaluate_rule
+    PIPE-->>CLI: TrainResult with report
+    CLI->>FS: bundle.save: price.joblib, metrics JSON, model card
+    CLI-->>OP: report table and saved paths
+    OP->>CLI: autovalue serve
+    CLI->>API: create_app, uvicorn.run
+    API->>FS: bundle.load(price.joblib)
+    LS->>API: POST /price/approve with car and listed_price
+    API->>QM: coerce_input, then predict_band
+    QM-->>API: low, mid, high
+    API->>API: approval.decide
+    API-->>LS: decision, reason and band
+```
+
 ---
 
 ## 5. The table schemas and validation
 
 **Purpose.** Accept only rows that the models can use, and report each dropped row.
+
+```mermaid
+flowchart TD
+    IN[/"pandas table and table name"/] --> REQ{"Required column absent?"}
+    REQ -- "yes" --> ERR1[/"SchemaError"/]
+    REQ -- "no" --> CO["_coerce: number, category,<br/>boolean, date, ID"]
+    CO --> NORM["normalize_category:<br/>strip, lower case, join with _, aliases"]
+    NORM --> MISS{"Required value missing?"}
+    MISS -- "yes" --> DROP["Drop the row,<br/>count the reason in the report"]
+    MISS -- "no" --> RNG{"Value outside its range?"}
+    RNG -- "required column" --> DROP
+    RNG -- "optional column" --> NAN["Set NaN,<br/>add a warning"]
+    RNG -- "no" --> DUP{"Duplicate ID?"}
+    NAN --> DUP
+    DUP -- "yes, not the first" --> DROP
+    DUP -- "no" --> RULE{"Table rule fails?<br/>year after listing year + 1,<br/>or pickup before order"}
+    RULE -- "yes" --> DROP
+    RULE -- "no" --> EMPTY{"No row left?"}
+    EMPTY -- "yes" --> ERR2[/"SchemaError"/]
+    EMPTY -- "no" --> OUT[/"Clean table and ValidationReport"/]
+```
 
 | Input | Output |
 |---|---|
@@ -300,6 +465,29 @@ Columns that are not in the schema pass through without change. `coerce_input` u
 
 **Purpose.** Give the demo and the tests realistic tables with no download and a known noise floor.
 
+```mermaid
+flowchart LR
+    SEED[/"n, seed, dirty"/] --> RNG["numpy default_rng(seed)"]
+    subgraph LIST["make_listings"]
+        L1["Draw brand, model, listed_at,<br/>age, odometer, categories"] --> L2["oracle_price: base × depreciation<br/>× mileage × factors × market trend"]
+        L2 --> L3["price = oracle × log-normal noise,<br/>round to 100"]
+    end
+    subgraph DELIV["make_deliveries"]
+        D1["Draw city, store, drop point,<br/>ordered_at, picked_at, categories"] --> D2["oracle_minutes: 12 + wait<br/>+ travel + area + peak"]
+        D2 --> D3["delivery_minutes = oracle + normal noise,<br/>round, minimum 5"]
+    end
+    RNG --> L1
+    RNG --> D1
+    L3 --> DL{"dirty?"}
+    D3 --> DD{"dirty?"}
+    DL -- "yes" --> LDEF["_add_listing_defects: padded, upper case,<br/>missing, negative odometer, duplicates"]
+    DL -- "no" --> LOUT[/"listings + oracle_price"/]
+    LDEF --> LOUT
+    DD -- "yes" --> DDEF["Title case + trailing space,<br/>Metropolitian, 2 % missing weather"]
+    DD -- "no" --> DOUT[/"deliveries + oracle_minutes"/]
+    DDEF --> DOUT
+```
+
 | Function | Output columns | Label | Noise |
 |---|---|---|---|
 | `make_listings(n, seed, dirty)` | listings schema + `oracle_price` | `price` | log-normal, σ = `PRICE_NOISE_SIGMA` = 0.12 |
@@ -333,10 +521,42 @@ Columns that are not in the schema pass through without change. `coerce_input` u
 
 **Purpose.** Change the clean rows into model features with no fitted state, and cut the rows by time.
 
+```mermaid
+flowchart LR
+    subgraph CAR["CarFeatures.transform"]
+        C1[/"listed_at, year, odometer_km,<br/>owners, accidents, engine_l"/] --> C2["age_years, km_per_year, listing_time,<br/>accidents as 0 or 1"]
+        C3[/"brand, model"/] --> C4["brand_model key"]
+        C5[/"brand, fuel, transmission,<br/>body_type, city"/] --> C6["normalize_category"]
+    end
+    subgraph DEL["DeliveryFeatures.transform"]
+        D1[/"store and drop<br/>lat, lon"/] --> D2["haversine_km<br/>distance_km"]
+        D3[/"ordered_at, picked_at"/] --> D4["pickup_wait_min, order_hour,<br/>order_weekday, is_weekend, is_peak"]
+        D5[/"weather, traffic,<br/>area, vehicle"/] --> D6["normalize_category"]
+    end
+    C2 --> PREP["prep step of the<br/>model pipeline"]
+    C4 --> PREP
+    C6 --> PREP
+    D2 --> PREP
+    D4 --> PREP
+    D6 --> PREP
+```
+
 | Builder | Numeric features | Category features | High-cardinality feature |
 |---|---|---|---|
 | `CarFeatures` | `age_years`, `odometer_km`, `km_per_year`, `owners`, `accidents`, `engine_l`, `listing_time` | `brand`, `fuel`, `transmission`, `body_type`, `city` | `brand_model` |
 | `DeliveryFeatures` | `distance_km`, `pickup_wait_min`, `order_hour`, `order_weekday`, `is_weekend`, `is_peak` | `weather`, `traffic`, `area`, `vehicle` | — |
+
+```mermaid
+flowchart TD
+    IN[/"Validated table and time column<br/>listed_at or ordered_at"/] --> N{"Fewer than 3<br/>distinct times?"}
+    N -- "yes" --> RND["Seeded random split<br/>70 / 15 / 15 %"]
+    RND --> NOTE[/"Split method random,<br/>with a note"/]
+    N -- "no" --> CUT["Cut times at the<br/>0.70 and 0.85 quantiles"]
+    CUT --> PARTS["train: before cut 1<br/>val: from cut 1 to cut 2<br/>test: from cut 2"]
+    PARTS --> E{"Empty part?"}
+    E -- "yes" --> ERR[/"ValueError"/]
+    E -- "no" --> OUT[/"Split method time,<br/>with the cutoffs"/]
+```
 
 **Procedure of the time split**
 
@@ -344,6 +564,7 @@ Columns that are not in the schema pass through without change. `coerce_input` u
 2. Calculate the cut times at the 70 % and 85 % quantiles of time.
 3. Put rows before the first cut in train, rows between the cuts in validation, and later rows in test.
 4. If the time column has fewer than 3 distinct values, do a seeded random split and record a note.
+5. If one part of the time split is empty, stop with `ValueError`.
 
 **Rules**
 
@@ -356,6 +577,29 @@ Columns that are not in the schema pass through without change. `coerce_input` u
 ## 8. The quantile models and calibration
 
 **Purpose.** Give a low, a middle and a high estimate with a stated coverage.
+
+```mermaid
+flowchart TD
+    TR[/"train part"/] --> Y["task.y: natural log<br/>for the price task"]
+    Y --> LOOP["For each quantile:<br/>BAND_LOW, 0.5, BAND_HIGH"]
+    LOOP --> P1["features: CarFeatures<br/>or DeliveryFeatures"]
+    P1 --> P2["prep: median imputer, OneHotEncoder,<br/>TargetEncoder for brand_model"]
+    P2 --> BK{"AUTOVALUE_BACKEND"}
+    BK -- "sklearn" --> HGB["HistGradientBoostingRegressor<br/>loss quantile"]
+    BK -- "lightgbm" --> LGB["LGBMRegressor<br/>objective quantile"]
+    HGB --> PIPES["3 fitted pipelines<br/>pipelines_"]
+    LGB --> PIPES
+    VA[/"validation part"/] --> RAW["_raw: predict 3 values, sort"]
+    PIPES --> RAW
+    RAW --> SC["Score of each row:<br/>max of low − y and y − high"]
+    SC --> OFF["offset_ = score quantile at level<br/>ceil of (n + 1)(1 − α), divided by n"]
+    NEW[/"Test rows or new rows"/] --> RAW2["_raw: predict 3 values, sort"]
+    PIPES --> RAW2
+    RAW2 --> BAND["predict_band: low − offset, high + offset,<br/>mid clipped into the band"]
+    OFF --> BAND
+    BAND --> EXPN["from_model_scale:<br/>exp for the price task"]
+    EXPN --> OUT[/"Band: low, mid, high"/]
+```
 
 | Step | Object | Fit on |
 |---|---|---|
@@ -387,6 +631,25 @@ Columns that are not in the schema pass through without change. `coerce_input` u
 
 **Purpose.** Show if the model is better than a simple rule, and how near it is to the best possible error.
 
+```mermaid
+flowchart LR
+    TR[/"train part"/] --> GM["GroupMedianBaseline<br/>most specific group, 5 or more rows"]
+    TR --> LIN["LinearBaseline<br/>Ridge, alpha 1"]
+    TE[/"test part"/] --> PRED["Predictions on<br/>the same test rows"]
+    GM --> PRED
+    LIN --> PRED
+    QM["quantile_gbm<br/>calibrated mid value"] --> PRED
+    OR["oracle_noise_floor<br/>only if an oracle column exists"] --> PRED
+    PRED --> MET["regression_metrics + mae_ci<br/>for each model"]
+    MET --> BEST["Best baseline:<br/>lowest MAE"]
+    BEST --> PAIR["paired_mae_difference<br/>model minus best baseline"]
+    PAIR --> V{"95 % interval"}
+    V -- "upper bound below 0" --> VA[/"a better: model"/]
+    V -- "lower bound above 0" --> VB[/"b better: baseline"/]
+    V -- "contains 0" --> VC[/"no clear difference"/]
+    MET --> BIAS[/"bias_ci, and interval_metrics<br/>before and after calibration"/]
+```
+
 | Model | How it predicts |
 |---|---|
 | `group_median` | Median label of the most specific group with at least 5 training rows. Price: brand-model-year, brand-model, brand, all. Delivery: traffic-area, traffic, all |
@@ -401,7 +664,7 @@ Columns that are not in the schema pass through without change. `coerce_input` u
 | Bias, with a 95 % bootstrap interval | Mean of (prediction − actual). It tells the direction of the error, not the accuracy |
 | Paired MAE difference | MAE(model) − MAE(best baseline), paired bootstrap. A negative upper bound means that the model is better |
 | Coverage, mean width, mean relative width | Band quality before and after calibration |
-| Validation importance | Increase of the MAE of the middle model when one input column is shuffled, on the validation part |
+| Validation importance | Increase of the MAE of the middle model when one input column is shuffled, on the validation part. For the price task, this MAE is on the log-price scale |
 
 **Rules**
 
@@ -414,12 +677,43 @@ Columns that are not in the schema pass through without change. `coerce_input` u
 
 **Purpose.** Approve fair prices automatically and send doubtful prices to a human.
 
+```mermaid
+flowchart TD
+    IN[/"Listed price and band<br/>low, mid, high"/] --> P{"Listed price ≤ 0?"}
+    P -- "yes" --> ERR[/"ValueError"/]
+    P -- "no" --> ORD{"low ≤ mid ≤ high?"}
+    ORD -- "no" --> ERR
+    ORD -- "yes" --> LO{"Listed price below low?"}
+    LO -- "yes" --> RL[/"review_low<br/>price is amount below the band"/]
+    LO -- "no" --> HI{"Listed price above high?"}
+    HI -- "yes" --> RH[/"review_high<br/>price is amount above the band"/]
+    HI -- "no" --> AA[/"auto_approve<br/>price is inside the band"/]
+    RL --> HUMAN{{"HUMAN<br/>manual review"}}
+    RH --> HUMAN
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class HUMAN human
+```
+
 | Condition | Decision | Reason text |
 |---|---|---|
 | `low ≤ listed price ≤ high` | `auto_approve` | `price is inside the band` |
 | `listed price < low` | `review_low` | `price is <amount> below the band` |
 | `listed price > high` | `review_high` | `price is <amount> above the band` |
 | `listed price ≤ 0` or `low > mid` or `mid > high` | `ValueError` | — |
+
+```mermaid
+flowchart LR
+    TE[/"Test listings<br/>and their bands"/] --> MP["make_mispriced:<br/>seeded 30 % of rows"]
+    MP --> F{"Under or over,<br/>50 / 50"}
+    F -- "under" --> U["price × 0.45 to 0.7"]
+    F -- "over" --> O["price × 1.45 to 2.2"]
+    U --> DM["decide_many:<br/>listed_price against the band"]
+    O --> DM
+    MP -- "other rows keep the real price" --> DM
+    DM --> CM["evaluate_rule: review = flagged,<br/>confusion tp, fp, fn, tn"]
+    CM --> OUT[/"auto_approve_rate, precision,<br/>recall, false_review_rate"/]
+```
 
 **Procedure of the rule score**
 
@@ -435,6 +729,22 @@ Columns that are not in the schema pass through without change. `coerce_input` u
 ## 11. The negotiation simulation
 
 **Purpose.** Show how a seller and buyers act when the price band of one actual car is known.
+
+```mermaid
+flowchart TD
+    IN[/"Band low, mid, high,<br/>ask, episodes, seed"/] --> CHK{"low above 0, low ≤ mid ≤ high<br/>and ask above 0?"}
+    CHK -- "no" --> ERR[/"ValueError"/]
+    CHK -- "yes" --> ASK{"ask above mid?"}
+    ASK -- "yes" --> CON["Offer path for 10 rounds:<br/>gap to mid × 0.8 each round,<br/>never below low"]
+    ASK -- "no" --> FLAT["Offer path:<br/>the ask in each round"]
+    CON --> BUY["Each episode: buyer value from<br/>triangular low, mid, high"]
+    FLAT --> BUY
+    BUY --> ACC{"An offer ≤ buyer value<br/>in 10 rounds?"}
+    ACC -- "yes" --> DEAL["Deal at the first such offer,<br/>count the rounds"]
+    ACC -- "no" --> NODEAL["No deal"]
+    DEAL --> OUT[/"NegotiationSummary: deal_rate,<br/>mean_deal_price, mean_rounds_to_deal,<br/>deal_price_vs_mid"/]
+    NODEAL --> OUT
+```
 
 | Input | Output |
 |---|---|
@@ -512,7 +822,7 @@ autovalue serve --price-model models/price.joblib --eta-model models/eta.joblib 
 
 | Command | What it does |
 |---|---|
-| `demo` | Generates both tables, trains, calibrates and evaluates both tasks, prints an example decision |
+| `demo` | Generates both tables, trains, calibrates and evaluates both tasks, and prints the report of each task. Then prints the band of one example car, the decisions for 3 listed prices (0.5, 1 and 1.8 times the middle value), the negotiation result and the band of one example order. Writes no files |
 | `generate` | Writes the synthetic CSV files |
 | `validate` | Prints the validation report of a CSV |
 | `train` | Validates, splits, fits, calibrates, evaluates and saves the model files |
@@ -523,11 +833,28 @@ autovalue serve --price-model models/price.joblib --eta-model models/eta.joblib 
 
 The `--input` value is a JSON object, a JSON list or the path of a `.json` file.
 
+The diagram shows the order of the commands and the files that connect them.
+
+```mermaid
+flowchart LR
+    INS["pip install -e .[dev]"] --> GEN["autovalue generate"]
+    GEN --> CSV[("data/listings.csv<br/>data/deliveries.csv")]
+    CSV --> VAL["autovalue validate"]
+    CSV -- "--csv" --> TRN["autovalue train"]
+    INS -- "--synthetic" --> TRN
+    TRN --> MOD[("models/price.joblib<br/>models/eta.joblib")]
+    MOD --> EST["autovalue estimate"]
+    MOD --> APR["autovalue approve"]
+    MOD --> SIM["autovalue simulate"]
+    MOD --> SRV["autovalue serve"]
+    INS --> DEMO["autovalue demo<br/>trains in memory, writes no files"]
+```
+
 ### 13.4 Environment variables
 
 | Variable | Used by | Meaning |
 |---|---|---|
-| `AUTOVALUE_SEED` | All components | Seed of the models, the bootstrap and the rule score. Default 42 |
+| `AUTOVALUE_SEED` | `train`, `demo` | Seed of the random split fallback, the models, the bootstrap, the feature ranking, the rule score and the `demo` negotiation. Default 42. It is not the data seed: the synthetic data and the `simulate` command use the `--seed` CLI argument (default 42) |
 | `AUTOVALUE_DATA_DIR` | `generate` | Output folder when `--out` is not given. Default `data` |
 | `AUTOVALUE_MODEL_DIR` | `train` | Output folder when `--out` is not given. Default `models` |
 | `AUTOVALUE_BAND_LOW` | Quantile models | Low quantile. Default 0.10. Must be in (0, 0.5) |
@@ -536,6 +863,16 @@ The `--input` value is a JSON object, a JSON list or the path of a `.json` file.
 | `AUTOVALUE_MAX_ITER` | Quantile models | Boosting iterations. Default 300, minimum 10 |
 
 The CLI reads a local `.env` file. A variable that is already in the environment wins. A value that is not valid stops the command with `error:`. autovalue needs no credentials.
+
+```mermaid
+flowchart LR
+    ENV[/".env file"/] --> LD["load_dotenv:<br/>sets only absent variables"]
+    PENV[/"Process environment"/] --> FE["Settings.from_env"]
+    LD --> FE
+    FE --> CHK{"Values valid?<br/>range checks"}
+    CHK -- "yes" --> SET[/"Settings: seed, data_dir, model_dir,<br/>band, backend, max_iter"/]
+    CHK -- "no" --> ERR[/"ConfigError: the CLI prints<br/>error: and returns 1"/]
+```
 
 ---
 
